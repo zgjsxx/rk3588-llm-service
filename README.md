@@ -115,3 +115,23 @@ cd export
 python generate_data_quant.py -m /path/to/DeepSeek-R1-Distill-Qwen-1.5B
 python export_rkllm.py
 ```
+
+## Function Calling Test
+
+After starting the API, you can send a built-in `add` tool definition with:
+
+```bash
+python tests/manual_function_calling_add.py
+```
+
+Force the model to return an `add` function call:
+
+```bash
+python tests/manual_function_calling_add.py --tool-choice force
+```
+
+You can also test the built-in demo tool `get_whether` directly:
+
+```bash
+python tests/manual_builtin_tool_get_whether.py --city Hangzhou
+```

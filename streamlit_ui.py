@@ -48,6 +48,12 @@ def build_messages(system_prompt: str, current_prompt: str) -> list[dict[str, st
 def render_history() -> None:
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
+            tool_calls = message.get("tool_calls")
+            if tool_calls:
+                st.markdown("Function call requested:")
+                st.json(tool_calls)
+                continue
+
             think_text, answer_text = split_response_text(message["content"])
             if think_text:
                 with st.expander("Thought Process", expanded=False):
@@ -55,7 +61,7 @@ def render_history() -> None:
             st.markdown(answer_text or message["content"])
 
 
-def call_non_stream(payload: dict[str, Any], timeout: float) -> tuple[str, str]:
+def call_non_stream(payload: dict[str, Any], timeout: float) -> tuple[str, str, list[dict[str, Any]] | None]:
     response = httpx.post(
         f"{st.session_state.api_base}/v1/chat/completions",
         json=payload,
@@ -63,7 +69,10 @@ def call_non_stream(payload: dict[str, Any], timeout: float) -> tuple[str, str]:
     )
     response.raise_for_status()
     data = response.json()
-    return data["choices"][0]["message"]["content"], data.get("request_id", response.headers.get("X-Request-Id", ""))
+    message = data["choices"][0]["message"]
+    content = message.get("content") or ""
+    tool_calls = message.get("tool_calls")
+    return content, data.get("request_id", response.headers.get("X-Request-Id", "")), tool_calls
 
 
 def stream_response(payload: dict[str, Any], timeout: float):
@@ -175,6 +184,7 @@ if prompt:
 
     with st.chat_message("assistant"):
         assistant_placeholder = st.empty()
+        tool_calls: list[dict[str, Any]] | None = None
         try:
             if st.session_state.use_stream:
                 full_text = ""
@@ -189,16 +199,21 @@ if prompt:
                         st.markdown(answer_text or full_text)
                 st.session_state.last_trace["request_id"] = backend_request_id
             else:
-                full_text, backend_request_id = call_non_stream(payload, st.session_state.timeout)
+                full_text, backend_request_id, tool_calls = call_non_stream(payload, st.session_state.timeout)
                 st.session_state.last_trace["request_id"] = backend_request_id or request_id
-                think_text, answer_text = split_response_text(full_text)
                 with assistant_placeholder.container():
-                    if think_text:
-                        with st.expander("Thought Process", expanded=False):
-                            st.markdown(think_text)
-                    st.markdown(answer_text or full_text)
+                    if tool_calls:
+                        st.markdown("Function call requested:")
+                        st.json(tool_calls)
+                    else:
+                        think_text, answer_text = split_response_text(full_text)
+                        if think_text:
+                            with st.expander("Thought Process", expanded=False):
+                                st.markdown(think_text)
+                        st.markdown(answer_text or full_text)
             st.session_state.last_trace["status"] = "ok"
             st.session_state.last_trace["response_text"] = full_text
+            st.session_state.last_trace["tool_calls"] = tool_calls
         except httpx.HTTPStatusError as exc:
             try:
                 error_payload = exc.response.json()
@@ -218,4 +233,4 @@ if prompt:
             st.session_state.last_trace["response_text"] = full_text
 
     st.session_state.messages.append({"role": "user", "content": prompt})
-    st.session_state.messages.append({"role": "assistant", "content": full_text})
+    st.session_state.messages.append({"role": "assistant", "content": full_text, "tool_calls": tool_calls})
