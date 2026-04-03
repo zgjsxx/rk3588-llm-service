@@ -29,6 +29,83 @@ def latest_user_content(messages: Iterable[ChatMessage | dict[str, str]]) -> str
     return latest
 
 
+def _message_tool_call_id(message: Any) -> str | None:
+    if isinstance(message, dict):
+        value = message.get("tool_call_id")
+        return str(value) if value else None
+    value = getattr(message, "tool_call_id", None)
+    return str(value) if value else None
+
+
+def _message_tool_calls(message: Any) -> list[Any]:
+    if isinstance(message, dict):
+        value = message.get("tool_calls")
+        return value if isinstance(value, list) else []
+    value = getattr(message, "tool_calls", None)
+    return list(value) if value else []
+
+
+def _normalize_tool_call_payload(tool_call: Any) -> dict[str, Any]:
+    if isinstance(tool_call, dict):
+        return tool_call
+    function = getattr(tool_call, "function", None)
+    function_payload: dict[str, Any] | None = None
+    if function is not None:
+        function_payload = {
+            "name": getattr(function, "name", ""),
+            "arguments": getattr(function, "arguments", ""),
+        }
+    return {
+        "id": getattr(tool_call, "id", ""),
+        "type": getattr(tool_call, "type", "function"),
+        "function": function_payload,
+    }
+
+
+def _tool_parts(tool: ToolDefinition | dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    if isinstance(tool, dict):
+        function = dict(tool.get("function", {}) or {})
+        return (
+            str(function.get("name", "")),
+            str(function.get("description", "") or ""),
+            dict(function.get("parameters", {}) or {}),
+        )
+    return (
+        tool.function.name,
+        tool.function.description or "",
+        dict(tool.function.parameters or {}),
+    )
+
+
+def _messages_after_latest_user(messages: Iterable[ChatMessage | dict[str, Any]]) -> list[Any]:
+    items = list(messages)
+    latest_user_index = -1
+    for index, message in enumerate(items):
+        role, _ = _message_role_and_content(message)
+        if role == "user":
+            latest_user_index = index
+    if latest_user_index < 0:
+        return []
+    return items[latest_user_index + 1 :]
+
+
+def _tool_result_prompt_block(messages: Iterable[ChatMessage | dict[str, Any]]) -> str:
+    rows: list[str] = []
+    for message in _messages_after_latest_user(messages):
+        role, content = _message_role_and_content(message)
+        if role == "assistant":
+            tool_calls = _message_tool_calls(message)
+            if tool_calls:
+                normalized = [_normalize_tool_call_payload(item) for item in tool_calls]
+                rows.append(
+                    f"Assistant tool calls: {json.dumps(normalized, ensure_ascii=False, sort_keys=True)}"
+                )
+        elif role == "tool":
+            tool_call_id = _message_tool_call_id(message) or ""
+            rows.append(f"Tool result ({tool_call_id}): {content}")
+    return "\n".join(rows)
+
+
 def _format_tool_choice(tool_choice: str | ToolChoiceObject | dict[str, Any] | None) -> str:
     if tool_choice is None:
         return "auto"
@@ -40,7 +117,7 @@ def _format_tool_choice(tool_choice: str | ToolChoiceObject | dict[str, Any] | N
 
 
 def _tool_prompt_block(
-    tools: list[ToolDefinition],
+    tools: list[ToolDefinition | dict[str, Any]],
     tool_choice: str | ToolChoiceObject | dict[str, Any] | None,
 ) -> str:
     forced_tool_name = None
@@ -49,18 +126,20 @@ def _tool_prompt_block(
     elif isinstance(tool_choice, ToolChoiceObject):
         forced_tool_name = tool_choice.function.name
 
-    formatted_tools = [
-        json.dumps(
-            {
-                "name": tool.function.name,
-                "description": tool.function.description or "",
-                "parameters": tool.function.parameters,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
+    formatted_tools = []
+    for tool in tools:
+        name, description, parameters = _tool_parts(tool)
+        formatted_tools.append(
+            json.dumps(
+                {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         )
-        for tool in tools
-    ]
     sections = [
         "You are producing output for a tool-calling parser.",
         f"Tool choice policy: {_format_tool_choice(tool_choice)}.",
@@ -79,7 +158,7 @@ def _tool_prompt_block(
         "Do not include markdown fences when returning JSON.",
         "If no function is needed, reply with a normal natural-language answer.",
     ]
-    add_tool_names = {tool.function.name for tool in tools if tool.function.name == "add"}
+    add_tool_names = {name for name, _, _ in (_tool_parts(tool) for tool in tools) if name == "add"}
     if add_tool_names and (len(tools) == 1 or forced_tool_name == "add"):
         sections.extend(
             [
@@ -107,12 +186,27 @@ def build_prompt(
     messages: Iterable[ChatMessage | dict[str, str]],
     prompt_prefix: str = DEFAULT_PROMPT_PREFIX,
     prompt_postfix: str = DEFAULT_PROMPT_POSTFIX,
-    tools: list[ToolDefinition] | None = None,
+    tools: list[ToolDefinition | dict[str, Any]] | None = None,
     tool_choice: str | ToolChoiceObject | dict[str, Any] | None = None,
 ) -> str:
     user_content = latest_user_content(messages)
     if not tools:
         return f"{prompt_prefix}User: {user_content}{prompt_postfix}"
+
+    tool_result_block = _tool_result_prompt_block(messages)
+    if tool_result_block:
+        prompt_body = "\n\n".join(
+            [
+                "You are answering the user after tool execution.",
+                "The tool results below are authoritative.",
+                "Do not call any tool again if the tool results already answer the question.",
+                "Do not output tool_calls JSON.",
+                "Reply with a concise natural-language answer for the user.",
+                f"User: {user_content}",
+                tool_result_block,
+            ]
+        )
+        return f"{prompt_prefix}{prompt_body}{prompt_postfix}"
 
     prompt_body = "\n\n".join(
         [

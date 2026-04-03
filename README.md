@@ -24,7 +24,7 @@ docs/                 additional documentation
 
 ```text
 rkllm-runtime == 1.1.4
-python == 3.8 or 3.10
+python == 3.10
 ```
 
 ## Python Virtual Environment
@@ -107,6 +107,22 @@ The Streamlit sidebar includes a `Trace` panel showing:
 - messages sent to FastAPI
 - final rendered prompt
 - request status and error summary
+
+## Run LangChain UI
+
+Start the API first, then launch the LangChain 1.x agent UI:
+
+```bash
+chmod +x scripts/run-ui-langchain.sh
+./scripts/run-ui-langchain.sh
+```
+
+Open `http://127.0.0.1:8502`.
+
+This UI uses LangChain 1.x `create_agent` with two built-in tools:
+
+- `add(a, b)`
+- `get_whether(city)`
 
 ## Model Export
 

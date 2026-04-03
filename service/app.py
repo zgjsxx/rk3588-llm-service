@@ -389,6 +389,12 @@ def create_app(engine_factory: Optional[Callable[[], RkllmEngine]] = None) -> Fa
                     frequency_penalty=request.frequency_penalty,
                 )
             trace_event(
+                "fastapi.model.output",
+                request_id=request_id,
+                output_length=len(content),
+                output_text=content,
+            )
+            trace_event(
                 "fastapi.response.ready",
                 request_id=request_id,
                 duration_ms=round((time.time() - started_at) * 1000, 2),
@@ -503,6 +509,13 @@ def create_app(engine_factory: Optional[Callable[[], RkllmEngine]] = None) -> Fa
                         trace_event("fastapi.stream.error", request_id=request_id, error=error_holder["message"])
                         raise BridgeError(error_holder["message"])
 
+                    trace_event(
+                        "fastapi.model.output",
+                        request_id=request_id,
+                        stream=True,
+                        output_length=len(full_text),
+                        output_text=full_text,
+                    )
                     trace_event(
                         "fastapi.stream.finish",
                         request_id=request_id,

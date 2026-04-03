@@ -84,6 +84,18 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_compat_fields(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        if "max_tokens" not in data and "max_completion_tokens" in data:
+            data["max_tokens"] = data.pop("max_completion_tokens")
+        else:
+            data.pop("max_completion_tokens", None)
+        return data
+
     @model_validator(mode="after")
     def validate_messages(self) -> "ChatCompletionRequest":
         if not self.messages:
