@@ -100,6 +100,8 @@ def _normalize_tool_arguments(arguments: Any) -> str:
 
 
 def _extract_normal_answer_text(content: str) -> str | None:
+    # Some small-model outputs wrap a plain answer in a fake `tool_calls` payload.
+    # Treat that as ordinary assistant text so the demo degrades gracefully.
     for candidate in _tool_payload_candidates(content):
         for variant in _json_repair_variants(candidate):
             try:
@@ -296,6 +298,8 @@ def _parse_tool_calls(
     request: ChatCompletionRequest,
     request_id: str | None = None,
 ) -> tuple[list[dict[str, Any]] | None, str | None]:
+    # Parse in layers: strict JSON first, then narrow repair passes for the
+    # malformed shapes that this demo model tends to emit.
     repair_strategy = None
     if not request.tools:
         return None, None
@@ -517,6 +521,8 @@ def create_app(
             "raw_payload": raw_payload,
             "raw_payload_error": raw_payload_error,
         }
+        # `request.payload` preserves the client-facing JSON body, while
+        # `request.received` records the same request after schema parsing.
         trace_event(
             "fastapi.request.received",
             **request_log_fields,
@@ -629,6 +635,8 @@ def create_app(
                 request_id=request_id,
                 response_payload=response_payload,
             )
+            # `response.payload` is the client-facing JSON response; `response.ready`
+            # above captures the raw model text before any tool-call parsing/repair.
             response = JSONResponse(content=response_payload)
             response.headers["X-Request-Id"] = request_id
             return response

@@ -106,6 +106,8 @@ def _format_tool_choice(tool_choice: str | dict[str, Any] | None) -> str:
 def _select_messages(messages: Iterable[ChatMessage | dict[str, Any]]) -> list[dict[str, Any]]:
     items = [_normalize_message(message) for message in messages]
 
+    # The demo intentionally keeps prompt history tiny on-device: we only keep the
+    # latest user turn, plus any assistant/tool closure generated for that turn.
     latest_user_index = -1
     for index, message in enumerate(items):
         if message["role"] == "user":
@@ -131,6 +133,9 @@ def _render_first_tool_call_user_text(
     tools: list[dict[str, Any]],
     tool_choice: str | dict[str, Any] | None,
 ) -> str:
+    # DeepSeek's chat template does not expose available tools on the first round,
+    # so we inject a compact tool catalogue into the current user message only for
+    # the "discover a tool call" turn.
     sections = [
         "You are producing output for a tool-calling parser.",
         f"Tool choice policy: {_format_tool_choice(tool_choice)}.",
@@ -195,6 +200,8 @@ def _render_tool_follow_up_user_text(user_content: str) -> str:
 
 def _strip_generation_think_suffix(prompt: str) -> str:
     if prompt.endswith(_ASSISTANT_THINK_SUFFIX):
+        # For the first tool-call round we want JSON immediately, not a reasoning
+        # prelude that tends to push the small model into `<think>` output.
         return prompt[: -len(_ASSISTANT_THINK_SUFFIX)] + _ASSISTANT_SUFFIX
     return prompt
 
@@ -203,6 +210,8 @@ def _ensure_assistant_generation_suffix(prompt: str, *, allow_think: bool) -> st
     if prompt.endswith(_ASSISTANT_THINK_SUFFIX) or prompt.endswith(_ASSISTANT_SUFFIX):
         return prompt
     if prompt.endswith(_TOOL_OUTPUTS_END_SUFFIX):
+        # After tool outputs the model still needs an assistant-generation cue;
+        # otherwise it may keep imitating tool protocol tokens instead of replying.
         return prompt + (_ASSISTANT_THINK_SUFFIX if allow_think else _ASSISTANT_SUFFIX)
     return prompt
 
@@ -242,6 +251,9 @@ def build_prompt(
     if first_tool_round:
         prompt = _strip_generation_think_suffix(prompt)
     elif _has_tool_closure(selected_messages):
+        # Follow-up rounds keep the minimal closure for the latest request:
+        # latest user + assistant.tool_calls + tool result, then ask the model to
+        # answer from the tool result instead of explaining the payload.
         selected_messages = [
             {
                 **selected_messages[0],

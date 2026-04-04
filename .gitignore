@@ -1,0 +1,11 @@
+# Python cache and virtualenv
+__pycache__/
+.pytest_cache/
+.venv/
+
+# Runtime logs and local trace output
+logs/
+
+# Local RKLLM model artifacts
+models/*.rkllm
+!models/.gitkeep

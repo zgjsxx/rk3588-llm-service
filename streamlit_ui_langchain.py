@@ -102,6 +102,8 @@ def render_history() -> None:
 
 
 def create_langchain_agent(request_id: str) -> Any:
+    # The UI forwards its own request_id into the OpenAI-compatible service so
+    # front-end and back-end trace events can be stitched together later.
     model = ChatOpenAI(
         model=st.session_state.model_name,
         api_key="dummy",
@@ -256,6 +258,8 @@ def emit_ui_agent_request_trace(
     messages: list[dict[str, Any]],
     mode: str,
 ) -> None:
+    # These UI-side trace events mirror the service-side events and form the
+    # outer boundary of a full agent -> service -> model -> service chain.
     trace_event(
         "ui.agent.request",
         request_id=request_id,
@@ -366,6 +370,8 @@ prompt = st.chat_input("Type a message and press Enter")
 if prompt:
     request_id = f"ui-agent-{uuid.uuid4().hex}"
     st.session_state.messages.append({"role": "user", "content": prompt})
+    # The agent keeps cumulative chat history and lets the service trim it down
+    # to the latest-user closure when building the on-device prompt.
     st.session_state.agent_messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.markdown(prompt)

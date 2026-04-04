@@ -102,6 +102,8 @@ def aggregate_requests(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
         parsed_event = _last_stage_event(item["events_by_stage"], "fastapi.response.parsed")
         ui_response = _last_stage_event(item["events_by_stage"], "ui.agent.response")
         raw_request = _last_stage_event(item["events_by_stage"], "fastapi.request.payload")
+        # A single request_id may span multiple service rounds when the agent
+        # first receives tool_calls and then sends the tool result back.
         round_count = len(item["events_by_stage"].get("fastapi.prompt.built") or [])
 
         tool_used = bool(
@@ -190,6 +192,8 @@ def _render_step(label: str, stage: str, events_by_stage: dict[str, list[dict[st
         _render_payload(_step_payload(events[-1], stage))
         return
 
+    # Service stages can repeat within one request_id for tool-calling flows, so
+    # the viewer expands them round by round instead of only showing the last one.
     for index, event in enumerate(events, start=1):
         timestamp = event.get("timestamp") or "-"
         with st.expander(f"第 {index} 轮 | {timestamp}", expanded=index == len(events)):
