@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import uuid
@@ -6,7 +6,6 @@ from typing import Any
 
 import httpx
 import streamlit as st
-from service.prompting import build_prompt
 from service.response_cleaning import split_response_text
 
 
@@ -154,11 +153,7 @@ prompt = st.chat_input("Type a message and press Enter")
 if prompt:
     request_id = f"ui-{uuid.uuid4().hex}"
     payload_messages = build_messages(st.session_state.system_prompt, prompt)
-    rendered_prompt = build_prompt(
-        payload_messages,
-        prompt_prefix="<｜begin▁of▁sentence｜><｜User｜>",
-        prompt_postfix="<｜Assistant｜>",
-    )
+    rendered_prompt = "<prompt rendered on server>"
     with st.chat_message("user"):
         st.markdown(prompt)
 

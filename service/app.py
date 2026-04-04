@@ -12,10 +12,10 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .prompting import build_prompt
+from .prompting import build_prompt, load_tokenizer
 from .rkllm_bridge import BridgeError, RkllmEngine, load_engine_config_from_env
 from .schemas import ChatCompletionError, ChatCompletionErrorResponse, ChatCompletionRequest, ToolCall
-from .trace import get_trace_file, trace_event
+from .trace import get_trace_file, trace_event, trace_stdout_event
 
 
 def _completion_id() -> str:
@@ -45,6 +45,52 @@ def _extract_json_text(content: str) -> str:
     stripped = _THINK_TAG_PATTERN.sub("", content).strip()
     stripped = _CODE_FENCE_PATTERN.sub("", stripped).strip()
     return stripped
+
+
+def _rreplace(text: str, old: str, new: str, count: int = 1) -> str:
+    return new.join(text.rsplit(old, count))
+
+
+def _tool_payload_candidates(content: str) -> list[str]:
+    cleaned = _extract_json_text(content)
+    candidates = [cleaned]
+    tool_calls_index = cleaned.find('"tool_calls"')
+    if tool_calls_index >= 0:
+        object_start = cleaned.rfind("{", 0, tool_calls_index + 1)
+        if object_start >= 0:
+            candidates.append(cleaned[object_start:])
+
+    unique_candidates: list[str] = []
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if candidate and candidate not in unique_candidates:
+            unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _json_repair_variants(candidate: str) -> list[str]:
+    variants = [candidate]
+    if "]}}" in candidate:
+        variants.append(_rreplace(candidate, "]}}", "}]}", 1))
+    if candidate.count("[") > candidate.count("]"):
+        variants.append(candidate + ("]" * (candidate.count("[") - candidate.count("]"))))
+    if candidate.count("{") > candidate.count("}"):
+        variants.append(candidate + ("}" * (candidate.count("{") - candidate.count("}"))))
+
+    expanded = list(variants)
+    for variant in variants:
+        if variant.count("[") > variant.count("]") or variant.count("{") > variant.count("}"):
+            expanded.append(
+                variant
+                + ("]" * max(0, variant.count("[") - variant.count("]")))
+                + ("}" * max(0, variant.count("{") - variant.count("}")))
+            )
+
+    unique_variants: list[str] = []
+    for variant in expanded:
+        if variant not in unique_variants:
+            unique_variants.append(variant)
+    return unique_variants
 
 
 def _normalize_tool_arguments(arguments: Any) -> str:
@@ -89,53 +135,48 @@ def _repair_add_arguments(arguments: Any) -> dict[str, Any] | None:
 
 
 def _repair_add_tool_payload(content: str) -> tuple[list[dict[str, Any]] | None, str | None, str | None]:
+    for candidate in _tool_payload_candidates(content):
+        for variant in _json_repair_variants(candidate):
+            try:
+                payload = json.loads(variant)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            raw_tool_calls = payload.get("tool_calls")
+            if not isinstance(raw_tool_calls, list) or not raw_tool_calls:
+                continue
+            first = raw_tool_calls[0]
+            if not isinstance(first, dict):
+                continue
+            if first.get("type") == "function" and isinstance(first.get("function"), dict):
+                function_payload = first["function"]
+                name = function_payload.get("name")
+                arguments = function_payload.get("arguments")
+            else:
+                name = first.get("name")
+                arguments = first.get("arguments")
+            if name != "add":
+                continue
+            repaired_arguments = _repair_add_arguments(arguments)
+            if repaired_arguments is None:
+                continue
+            return (
+                [
+                    ToolCall(
+                        id=_tool_call_id(),
+                        type="function",
+                        function={
+                            "name": "add",
+                            "arguments": json.dumps(repaired_arguments, ensure_ascii=False, sort_keys=True),
+                        },
+                    ).model_dump()
+                ],
+                "repaired_add_payload",
+                None,
+            )
+
     cleaned = _extract_json_text(content)
-    repaired_variants = [cleaned]
-    if cleaned.count("{") > cleaned.count("}"):
-        repaired_variants.append(cleaned + ("}" * (cleaned.count("{") - cleaned.count("}"))))
-    if cleaned.count("[") > cleaned.count("]"):
-        repaired_variants.append(cleaned + ("]" * (cleaned.count("[") - cleaned.count("]"))))
-
-    for variant in repaired_variants:
-        try:
-            payload = json.loads(variant)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        raw_tool_calls = payload.get("tool_calls")
-        if not isinstance(raw_tool_calls, list) or not raw_tool_calls:
-            continue
-        first = raw_tool_calls[0]
-        if not isinstance(first, dict):
-            continue
-        if first.get("type") == "function" and isinstance(first.get("function"), dict):
-            function_payload = first["function"]
-            name = function_payload.get("name")
-            arguments = function_payload.get("arguments")
-        else:
-            name = first.get("name")
-            arguments = first.get("arguments")
-        if name != "add":
-            continue
-        repaired_arguments = _repair_add_arguments(arguments)
-        if repaired_arguments is None:
-            continue
-        return (
-            [
-                ToolCall(
-                    id=_tool_call_id(),
-                    type="function",
-                    function={
-                        "name": "add",
-                        "arguments": json.dumps(repaired_arguments, ensure_ascii=False, sort_keys=True),
-                    },
-                ).model_dump()
-            ],
-            "repaired_add_payload",
-            None,
-        )
-
     pair = _extract_two_numbers(cleaned)
     if pair is not None and "add" in cleaned:
         repaired_arguments = {"a": pair[0], "b": pair[1]}
@@ -153,6 +194,42 @@ def _repair_add_tool_payload(content: str) -> tuple[list[dict[str, Any]] | None,
             "repaired_add_numbers",
             None,
         )
+    return None, None, "repair_failed"
+
+
+def _repair_generic_tool_payload(
+    content: str,
+    allowed_tool_names: set[str],
+    forced_tool_name: str | None,
+) -> tuple[list[dict[str, Any]] | None, str | None, str | None]:
+    for candidate in _tool_payload_candidates(content):
+        for variant in _json_repair_variants(candidate):
+            try:
+                payload = json.loads(variant)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            raw_tool_calls = payload.get("tool_calls")
+            if not isinstance(raw_tool_calls, list) or not raw_tool_calls:
+                continue
+            parsed_tool_calls: list[dict[str, Any]] = []
+            valid = True
+            for item in raw_tool_calls:
+                if not isinstance(item, dict):
+                    valid = False
+                    break
+                parsed_tool_call, parse_error = _parse_single_tool_call(
+                    item,
+                    allowed_tool_names,
+                    forced_tool_name,
+                )
+                if parse_error is not None:
+                    valid = False
+                    break
+                parsed_tool_calls.append(parsed_tool_call)
+            if valid and parsed_tool_calls:
+                return parsed_tool_calls, "repaired_generic_tool_payload", None
     return None, None, "repair_failed"
 
 
@@ -205,6 +282,10 @@ def _parse_tool_calls(
     try:
         payload = json.loads(_extract_json_text(content))
     except json.JSONDecodeError as exc:
+        allowed_tool_names = {tool.function.name for tool in request.tools}
+        forced_tool_name = None
+        if request.tool_choice is not None and not isinstance(request.tool_choice, str):
+            forced_tool_name = request.tool_choice.function.name
         if _has_tool(request, "add"):
             repaired, repair_strategy, repair_error = _repair_add_tool_payload(content)
             if repaired is not None:
@@ -222,9 +303,32 @@ def _parse_tool_calls(
                 request_id=request_id,
                 repair_applied=False,
                 repair_strategy=repair_strategy,
-                repair_error=repair_error or f"invalid_json:{exc.msg}",
-                repaired_tool_calls=None,
+                    repair_error=repair_error or f"invalid_json:{exc.msg}",
+                    repaired_tool_calls=None,
+                )
+        repaired, repair_strategy, repair_error = _repair_generic_tool_payload(
+            content,
+            allowed_tool_names,
+            forced_tool_name,
+        )
+        if repaired is not None:
+            trace_event(
+                "fastapi.response.repair",
+                request_id=request_id,
+                repair_applied=True,
+                repair_strategy=repair_strategy,
+                repair_error=None,
+                repaired_tool_calls=repaired,
             )
+            return repaired, None
+        trace_event(
+            "fastapi.response.repair",
+            request_id=request_id,
+            repair_applied=False,
+            repair_strategy=repair_strategy,
+            repair_error=repair_error or f"invalid_json:{exc.msg}",
+            repaired_tool_calls=None,
+        )
         return None, f"invalid_json:{exc.msg}"
 
     if not isinstance(payload, dict):
@@ -265,18 +369,51 @@ def _parse_tool_calls(
                     repair_error=repair_error or parse_error,
                     repaired_tool_calls=None,
                 )
+            repaired, repair_strategy, repair_error = _repair_generic_tool_payload(
+                content,
+                allowed_tool_names,
+                forced_tool_name,
+            )
+            if repaired is not None:
+                trace_event(
+                    "fastapi.response.repair",
+                    request_id=request_id,
+                    repair_applied=True,
+                    repair_strategy=repair_strategy,
+                    repair_error=None,
+                    repaired_tool_calls=repaired,
+                )
+                return repaired, None
+            trace_event(
+                "fastapi.response.repair",
+                request_id=request_id,
+                repair_applied=False,
+                repair_strategy=repair_strategy,
+                repair_error=repair_error or parse_error,
+                repaired_tool_calls=None,
+            )
             return None, parse_error
         parsed_tool_calls.append(parsed_tool_call)
 
     return parsed_tool_calls, None
 
 
-def create_app(engine_factory: Optional[Callable[[], RkllmEngine]] = None) -> FastAPI:
+def create_app(
+    engine_factory: Optional[Callable[[], RkllmEngine]] = None,
+    tokenizer_factory: Optional[Callable[[str], Any]] = None,
+) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.generation_lock = asyncio.Lock()
         factory = engine_factory or (lambda: RkllmEngine(load_engine_config_from_env()))
         app.state.engine = factory()
+        tokenizer_loader = tokenizer_factory or load_tokenizer
+        try:
+            app.state.tokenizer = tokenizer_loader(app.state.engine.config.tokenizer_path)
+        except Exception as exc:
+            raise BridgeError(
+                f"Failed to load tokenizer from {app.state.engine.config.tokenizer_path}: {exc}"
+            ) from exc
         try:
             yield
         finally:
@@ -335,25 +472,42 @@ def create_app(engine_factory: Optional[Callable[[], RkllmEngine]] = None) -> Fa
     async def chat_completions(request: ChatCompletionRequest, raw_request: Request):
         engine = app.state.engine
         request_id = request.request_id or _completion_id()
+        raw_payload: Any = None
+        raw_payload_error: str | None = None
+        try:
+            raw_payload = await raw_request.json()
+        except Exception as exc:
+            raw_payload_error = str(exc)
+        request_log_fields = {
+            "request_id": request_id,
+            "model": request.model,
+            "stream": request.stream,
+            "messages": request.messages,
+            "tools": request.tools,
+            "tool_choice": request.tool_choice,
+            "max_tokens": request.max_tokens,
+            "temperature": request.temperature,
+            "top_p": request.top_p,
+            "presence_penalty": request.presence_penalty,
+            "frequency_penalty": request.frequency_penalty,
+            "client": str(raw_request.client),
+            "raw_payload": raw_payload,
+            "raw_payload_error": raw_payload_error,
+        }
         trace_event(
             "fastapi.request.received",
-            request_id=request_id,
-            model=request.model,
-            stream=request.stream,
-            messages=request.messages,
-            tools=request.tools,
-            tool_choice=request.tool_choice,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            presence_penalty=request.presence_penalty,
-            frequency_penalty=request.frequency_penalty,
-            client=str(raw_request.client),
+            **request_log_fields,
         )
+        stdout_request_fields = {
+            "request_id": request_id,
+            "client": str(raw_request.client),
+            "raw_payload": raw_payload,
+            "raw_payload_error": raw_payload_error,
+        }
+        trace_stdout_event("fastapi.request.payload", **stdout_request_fields)
         prompt = build_prompt(
             request.messages,
-            prompt_prefix=getattr(engine.config, "prompt_prefix", "<|begin_of_sentence|><|User|>"),
-            prompt_postfix=getattr(engine.config, "prompt_postfix", "<|Assistant|>"),
+            tokenizer=app.state.tokenizer,
             tools=request.tools,
             tool_choice=request.tool_choice,
         )

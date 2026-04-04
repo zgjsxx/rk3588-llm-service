@@ -16,6 +16,10 @@ def trace_enabled() -> bool:
     return os.getenv("RKLLM_TRACE", "1") != "0"
 
 
+def trace_stdout_enabled() -> bool:
+    return os.getenv("RKLLM_TRACE_STDOUT", "1") != "0"
+
+
 def get_trace_dir() -> Path:
     root = Path(__file__).resolve().parents[1]
     return Path(os.getenv("RKLLM_TRACE_DIR", str(root / "logs")))
@@ -59,3 +63,15 @@ def trace_event(stage: str, **fields: Any) -> None:
     with _TRACE_LOCK:
         with trace_file.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def trace_stdout_event(stage: str, **fields: Any) -> None:
+    if not trace_stdout_enabled():
+        return
+
+    event = {
+        "timestamp": datetime.now().isoformat(timespec="milliseconds"),
+        "stage": stage,
+    }
+    event.update({key: serialize_trace_value(value) for key, value in fields.items()})
+    print(json.dumps(event, ensure_ascii=False, indent=2), flush=True)

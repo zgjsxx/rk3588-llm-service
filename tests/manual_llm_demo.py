@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from service.prompting import build_prompt
+from service.prompting import build_prompt, load_tokenizer
 from service.rkllm_bridge import EngineConfig, RkllmEngine, load_engine_config_from_env
 
 
@@ -119,6 +119,7 @@ def main() -> int:
     print(f"bridge_lib: {config.bridge_lib_path}")
     print("type 'exit' to quit")
 
+    tokenizer = load_tokenizer(config.tokenizer_path)
     engine = RkllmEngine(config)
     try:
         while True:
@@ -135,8 +136,7 @@ def main() -> int:
 
             prompt = build_prompt(
                 [{"role": "user", "content": user_input}],
-                prompt_prefix=config.prompt_prefix,
-                prompt_postfix=config.prompt_postfix,
+                tokenizer=tokenizer,
             )
             request_id = f"manual-{uuid.uuid4().hex}"
 

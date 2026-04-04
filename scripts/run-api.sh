@@ -7,6 +7,8 @@ INSTALL_DIR="${ROOT_DIR}/dist/native/linux_aarch64"
 MODEL_NAME="${MODEL_NAME:-DeepSeek-R1-Distill-Qwen-1.5B_W8A8_RK3588.rkllm}"
 DEFAULT_MODEL_PATH="${ROOT_DIR}/models/${MODEL_NAME}"
 MODEL_PATH="${RKLLM_MODEL_PATH:-${DEFAULT_MODEL_PATH}}"
+DEFAULT_TOKENIZER_PATH="${ROOT_DIR}/models/DeepSeek-R1-Distill-Qwen-1.5B"
+TOKENIZER_PATH="${RKLLM_TOKENIZER_PATH:-${DEFAULT_TOKENIZER_PATH}}"
 BRIDGE_LIB="${RKLLM_BRIDGE_LIB:-${INSTALL_DIR}/librkllm_openai_bridge.so}"
 RUNTIME_LIB_DIR="${INSTALL_DIR}/lib"
 TRACE_DIR="${RKLLM_TRACE_DIR:-${ROOT_DIR}/logs}"
@@ -24,7 +26,14 @@ if [[ ! -f "${MODEL_PATH}" ]]; then
   exit 1
 fi
 
+if [[ ! -d "${TOKENIZER_PATH}" ]]; then
+  echo "tokenizer directory not found: ${TOKENIZER_PATH}"
+  echo "place the Hugging Face tokenizer files locally and set RKLLM_TOKENIZER_PATH if needed"
+  exit 1
+fi
+
 export RKLLM_MODEL_PATH="${MODEL_PATH}"
+export RKLLM_TOKENIZER_PATH="${TOKENIZER_PATH}"
 export RKLLM_BRIDGE_LIB="${BRIDGE_LIB}"
 export LD_LIBRARY_PATH="${RUNTIME_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 export RKLLM_MAX_NEW_TOKENS="${RKLLM_MAX_NEW_TOKENS:-2048}"

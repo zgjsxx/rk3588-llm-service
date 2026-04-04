@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import ctypes
 import os
@@ -37,6 +37,7 @@ class SamplingConfig(ctypes.Structure):
 class EngineConfig:
     model_path: str
     bridge_lib_path: str
+    tokenizer_path: str
     default_max_new_tokens: int = 2048
     max_context_len: int = 2048
     top_k: int = 1
@@ -47,8 +48,6 @@ class EngineConfig:
     presence_penalty: float = 0.0
     skip_special_token: bool = True
     model_name: str = "rkllm-local"
-    prompt_prefix: str = "<｜begin▁of▁sentence｜><｜User｜>"
-    prompt_postfix: str = "<｜Assistant｜>"
 
 
 class RkllmBridgeLibrary:
@@ -219,10 +218,12 @@ def load_engine_config_from_env() -> EngineConfig:
     root = Path(__file__).resolve().parents[1]
     default_bridge = root / "dist" / "native" / "linux_aarch64" / "librkllm_openai_bridge.so"
     default_model = root / "models" / "DeepSeek-R1-Distill-Qwen-1.5B_W8A8_RK3588.rkllm"
+    default_tokenizer = root / "models" / "DeepSeek-R1-Distill-Qwen-1.5B"
 
     return EngineConfig(
         model_path=os.getenv("RKLLM_MODEL_PATH", str(default_model)),
         bridge_lib_path=os.getenv("RKLLM_BRIDGE_LIB", str(default_bridge)),
+        tokenizer_path=os.getenv("RKLLM_TOKENIZER_PATH", str(default_tokenizer)),
         default_max_new_tokens=int(os.getenv("RKLLM_MAX_NEW_TOKENS", "2048")),
         max_context_len=int(os.getenv("RKLLM_MAX_CONTEXT_LEN", "2048")),
         top_k=int(os.getenv("RKLLM_TOP_K", "1")),
@@ -233,6 +234,4 @@ def load_engine_config_from_env() -> EngineConfig:
         presence_penalty=float(os.getenv("RKLLM_PRESENCE_PENALTY", "0.0")),
         skip_special_token=os.getenv("RKLLM_SKIP_SPECIAL_TOKEN", "1") != "0",
         model_name=os.getenv("RKLLM_MODEL_NAME", "rkllm-local"),
-        prompt_prefix=os.getenv("RKLLM_PROMPT_PREFIX", "<｜begin▁of▁sentence｜><｜User｜>"),
-        prompt_postfix=os.getenv("RKLLM_PROMPT_POSTFIX", "<｜Assistant｜>"),
     )

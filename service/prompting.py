@@ -1,32 +1,42 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 
-from .schemas import ChatMessage, ToolChoiceObject, ToolDefinition
+from transformers import AutoTokenizer
 
-DEFAULT_PROMPT_PREFIX = "<|begin_of_sentence|><|User|>"
-DEFAULT_PROMPT_POSTFIX = "<|Assistant|>"
+from .schemas import ChatMessage, ToolDefinition
 
 
-def _message_role_and_content(message: Any) -> tuple[str, str]:
+_ASSISTANT_THINK_SUFFIX = "<｜Assistant｜><think>\n"
+_ASSISTANT_SUFFIX = "<｜Assistant｜>"
+_TOOL_OUTPUTS_END_SUFFIX = "<｜tool▁outputs▁end｜>"
+
+
+class ChatTemplateTokenizer(Protocol):
+    def apply_chat_template(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tokenize: bool,
+        add_generation_prompt: bool,
+        tools: list[dict[str, Any]] | None = None,
+    ) -> str: ...
+
+
+def load_tokenizer(tokenizer_path: str) -> ChatTemplateTokenizer:
+    return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+
+
+def _message_role_and_content(message: Any) -> tuple[str, str | None]:
     if isinstance(message, dict):
         role = str(message.get("role", "user"))
-        content = str(message.get("content", "") or "")
-        return role, content
+        content = message.get("content")
+        return role, None if content is None else str(content)
 
     role = str(message.role)
-    content = str(message.content or "")
-    return role, content
-
-
-def latest_user_content(messages: Iterable[ChatMessage | dict[str, str]]) -> str:
-    latest = ""
-    for message in messages:
-        role, content = _message_role_and_content(message)
-        if role == "user":
-            latest = content.strip()
-    return latest
+    content = message.content
+    return role, None if content is None else str(content)
 
 
 def _message_tool_call_id(message: Any) -> str | None:
@@ -48,6 +58,7 @@ def _message_tool_calls(message: Any) -> list[Any]:
 def _normalize_tool_call_payload(tool_call: Any) -> dict[str, Any]:
     if isinstance(tool_call, dict):
         return tool_call
+
     function = getattr(tool_call, "function", None)
     function_payload: dict[str, Any] | None = None
     if function is not None:
@@ -55,6 +66,7 @@ def _normalize_tool_call_payload(tool_call: Any) -> dict[str, Any]:
             "name": getattr(function, "name", ""),
             "arguments": getattr(function, "arguments", ""),
         }
+
     return {
         "id": getattr(tool_call, "id", ""),
         "type": getattr(tool_call, "type", "function"),
@@ -62,89 +74,68 @@ def _normalize_tool_call_payload(tool_call: Any) -> dict[str, Any]:
     }
 
 
-def _tool_parts(tool: ToolDefinition | dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+def _normalize_message(message: ChatMessage | dict[str, Any]) -> dict[str, Any]:
+    role, content = _message_role_and_content(message)
+    payload: dict[str, Any] = {"role": role, "content": content}
+
+    tool_call_id = _message_tool_call_id(message)
+    if tool_call_id is not None:
+        payload["tool_call_id"] = tool_call_id
+
+    tool_calls = _message_tool_calls(message)
+    if tool_calls:
+        payload["tool_calls"] = [_normalize_tool_call_payload(item) for item in tool_calls]
+
+    return payload
+
+
+def _normalize_tool(tool: ToolDefinition | dict[str, Any]) -> dict[str, Any]:
     if isinstance(tool, dict):
-        function = dict(tool.get("function", {}) or {})
-        return (
-            str(function.get("name", "")),
-            str(function.get("description", "") or ""),
-            dict(function.get("parameters", {}) or {}),
-        )
-    return (
-        tool.function.name,
-        tool.function.description or "",
-        dict(tool.function.parameters or {}),
-    )
+        return tool
+    return tool.model_dump()
 
 
-def _messages_after_latest_user(messages: Iterable[ChatMessage | dict[str, Any]]) -> list[Any]:
-    items = list(messages)
-    latest_user_index = -1
-    for index, message in enumerate(items):
-        role, _ = _message_role_and_content(message)
-        if role == "user":
-            latest_user_index = index
-    if latest_user_index < 0:
-        return []
-    return items[latest_user_index + 1 :]
-
-
-def _tool_result_prompt_block(messages: Iterable[ChatMessage | dict[str, Any]]) -> str:
-    rows: list[str] = []
-    for message in _messages_after_latest_user(messages):
-        role, content = _message_role_and_content(message)
-        if role == "assistant":
-            tool_calls = _message_tool_calls(message)
-            if tool_calls:
-                normalized = [_normalize_tool_call_payload(item) for item in tool_calls]
-                rows.append(
-                    f"Assistant tool calls: {json.dumps(normalized, ensure_ascii=False, sort_keys=True)}"
-                )
-        elif role == "tool":
-            tool_call_id = _message_tool_call_id(message) or ""
-            rows.append(f"Tool result ({tool_call_id}): {content}")
-    return "\n".join(rows)
-
-
-def _format_tool_choice(tool_choice: str | ToolChoiceObject | dict[str, Any] | None) -> str:
+def _format_tool_choice(tool_choice: str | dict[str, Any] | None) -> str:
     if tool_choice is None:
         return "auto"
     if isinstance(tool_choice, str):
         return tool_choice
-    if isinstance(tool_choice, dict):
-        return f"required function: {tool_choice['function']['name']}"
-    return f"required function: {tool_choice.function.name}"
+    return f"required function: {tool_choice['function']['name']}"
 
 
-def _tool_prompt_block(
-    tools: list[ToolDefinition | dict[str, Any]],
-    tool_choice: str | ToolChoiceObject | dict[str, Any] | None,
+def _select_messages(messages: Iterable[ChatMessage | dict[str, Any]]) -> list[dict[str, Any]]:
+    items = [_normalize_message(message) for message in messages]
+
+    latest_user_index = -1
+    for index, message in enumerate(items):
+        if message["role"] == "user":
+            latest_user_index = index
+
+    if latest_user_index < 0:
+        return []
+
+    selected: list[dict[str, Any]] = [items[latest_user_index]]
+    for message in items[latest_user_index + 1 :]:
+        if message["role"] in {"assistant", "tool"}:
+            selected.append(message)
+
+    return selected
+
+
+def _has_tool_closure(messages: list[dict[str, Any]]) -> bool:
+    return any(message["role"] in {"assistant", "tool"} for message in messages[1:])
+
+
+def _render_first_tool_call_user_text(
+    user_content: str,
+    tools: list[dict[str, Any]],
+    tool_choice: str | dict[str, Any] | None,
 ) -> str:
-    forced_tool_name = None
-    if isinstance(tool_choice, dict):
-        forced_tool_name = tool_choice["function"]["name"]
-    elif isinstance(tool_choice, ToolChoiceObject):
-        forced_tool_name = tool_choice.function.name
-
-    formatted_tools = []
-    for tool in tools:
-        name, description, parameters = _tool_parts(tool)
-        formatted_tools.append(
-            json.dumps(
-                {
-                    "name": name,
-                    "description": description,
-                    "parameters": parameters,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            )
-        )
     sections = [
         "You are producing output for a tool-calling parser.",
         f"Tool choice policy: {_format_tool_choice(tool_choice)}.",
         "Available functions:",
-        *formatted_tools,
+        *[json.dumps(tool["function"], ensure_ascii=False, sort_keys=True) for tool in tools],
         'If a function call is required, respond with JSON only in this exact OpenAI-compatible shape: {"tool_calls":[{"type":"function","function":{"name":"function_name","arguments":{"arg_name":"value"}}}]}',
         "The arguments field must be a JSON object whose keys match the function parameter names.",
         "Do not use arrays, sets, or positional arguments for arguments.",
@@ -157,9 +148,11 @@ def _tool_prompt_block(
         'Valid example: {"tool_calls":[{"type":"function","function":{"name":"add","arguments":{"a":12,"b":30}}}]}',
         "Do not include markdown fences when returning JSON.",
         "If no function is needed, reply with a normal natural-language answer.",
+        f"User: {user_content}",
     ]
-    add_tool_names = {name for name, _, _ in (_tool_parts(tool) for tool in tools) if name == "add"}
-    if add_tool_names and (len(tools) == 1 or forced_tool_name == "add"):
+
+    add_tools = [tool for tool in tools if tool["function"]["name"] == "add"]
+    if add_tools and (len(tools) == 1 or _format_tool_choice(tool_choice) == "required function: add"):
         sections.extend(
             [
                 "For the add function, arguments must be exactly a JSON object with numeric keys a and b.",
@@ -170,48 +163,97 @@ def _tool_prompt_block(
                 "For add, do not answer with the final sum.",
             ]
         )
-    if forced_tool_name is not None:
+
+    if isinstance(tool_choice, dict):
+        forced_tool_name = tool_choice["function"]["name"]
         sections.extend(
             [
                 f"You must call the function named {forced_tool_name}.",
-                "Do not answer the math yourself.",
+                "Do not answer the task yourself.",
                 "Do not return natural language.",
                 "Your entire response must be a single JSON object with tool_calls.",
             ]
         )
+
     return "\n".join(sections)
 
 
-def build_prompt(
-    messages: Iterable[ChatMessage | dict[str, str]],
-    prompt_prefix: str = DEFAULT_PROMPT_PREFIX,
-    prompt_postfix: str = DEFAULT_PROMPT_POSTFIX,
-    tools: list[ToolDefinition | dict[str, Any]] | None = None,
-    tool_choice: str | ToolChoiceObject | dict[str, Any] | None = None,
-) -> str:
-    user_content = latest_user_content(messages)
-    if not tools:
-        return f"{prompt_prefix}User: {user_content}{prompt_postfix}"
-
-    tool_result_block = _tool_result_prompt_block(messages)
-    if tool_result_block:
-        prompt_body = "\n\n".join(
-            [
-                "You are answering the user after tool execution.",
-                "The tool results below are authoritative.",
-                "Do not call any tool again if the tool results already answer the question.",
-                "Do not output tool_calls JSON.",
-                "Reply with a concise natural-language answer for the user.",
-                f"User: {user_content}",
-                tool_result_block,
-            ]
-        )
-        return f"{prompt_prefix}{prompt_body}{prompt_postfix}"
-
-    prompt_body = "\n\n".join(
+def _render_tool_follow_up_user_text(user_content: str) -> str:
+    return "\n".join(
         [
-            _tool_prompt_block(tools, tool_choice),
+            "You have already received the tool result for this user request.",
+            "Use the tool result as the authoritative factual input.",
+            "Do not explain the JSON structure.",
+            "Do not describe the tool call process.",
+            "Do not restate field names such as city, weather, temperature_c, status, message, or final.",
+            "Answer the user's request directly in natural language.",
+            "Keep the answer concise and user-facing.",
             f"User: {user_content}",
         ]
     )
-    return f"{prompt_prefix}{prompt_body}{prompt_postfix}"
+
+
+def _strip_generation_think_suffix(prompt: str) -> str:
+    if prompt.endswith(_ASSISTANT_THINK_SUFFIX):
+        return prompt[: -len(_ASSISTANT_THINK_SUFFIX)] + _ASSISTANT_SUFFIX
+    return prompt
+
+
+def _ensure_assistant_generation_suffix(prompt: str, *, allow_think: bool) -> str:
+    if prompt.endswith(_ASSISTANT_THINK_SUFFIX) or prompt.endswith(_ASSISTANT_SUFFIX):
+        return prompt
+    if prompt.endswith(_TOOL_OUTPUTS_END_SUFFIX):
+        return prompt + (_ASSISTANT_THINK_SUFFIX if allow_think else _ASSISTANT_SUFFIX)
+    return prompt
+
+
+def build_prompt(
+    messages: Iterable[ChatMessage | dict[str, Any]],
+    tokenizer: ChatTemplateTokenizer,
+    tools: list[ToolDefinition | dict[str, Any]] | None = None,
+    tool_choice: str | dict[str, Any] | None = None,
+) -> str:
+    selected_messages = _select_messages(messages)
+    normalized_tools = None
+    first_tool_round = False
+    if tools and tool_choice != "none":
+        normalized_tools = [_normalize_tool(tool) for tool in tools]
+
+    if normalized_tools and selected_messages and not _has_tool_closure(selected_messages):
+        first_tool_round = True
+        selected_messages = [
+            {
+                "role": "user",
+                "content": _render_first_tool_call_user_text(
+                    selected_messages[0].get("content") or "",
+                    normalized_tools,
+                    tool_choice,
+                ),
+            }
+        ]
+        normalized_tools = None
+
+    prompt = tokenizer.apply_chat_template(
+        selected_messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        tools=normalized_tools,
+    )
+    if first_tool_round:
+        prompt = _strip_generation_think_suffix(prompt)
+    elif _has_tool_closure(selected_messages):
+        selected_messages = [
+            {
+                **selected_messages[0],
+                "content": _render_tool_follow_up_user_text(selected_messages[0].get("content") or ""),
+            },
+            *selected_messages[1:],
+        ]
+        prompt = tokenizer.apply_chat_template(
+            selected_messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            tools=normalized_tools,
+        )
+        prompt = _ensure_assistant_generation_suffix(prompt, allow_think=False)
+    return prompt

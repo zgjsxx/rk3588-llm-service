@@ -1,4 +1,4 @@
-import json
+﻿import json
 
 from fastapi.testclient import TestClient
 
@@ -11,11 +11,12 @@ class FakeEngine:
         self.config = EngineConfig(
             model_path="fake.rkllm",
             bridge_lib_path="fake.so",
+            tokenizer_path="fake-tokenizer",
             model_name="rkllm-local",
         )
 
     def generate(self, prompt: str, on_token, request_id: str, **_) -> str:
-        assert "User: ping" in prompt
+        assert '"content": "ping"' in prompt
         assert request_id
         for token in ["po", "ng"]:
             on_token(token)
@@ -25,8 +26,30 @@ class FakeEngine:
         return None
 
 
+class FakeTokenizer:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, tools=None):
+        self.calls.append(
+            {
+                "messages": messages,
+                "tokenize": tokenize,
+                "add_generation_prompt": add_generation_prompt,
+                "tools": tools,
+            }
+        )
+        return json.dumps({"messages": messages, "tools": tools}, ensure_ascii=False, sort_keys=True)
+
+
+def _make_app(engine_factory):
+    tokenizer = FakeTokenizer()
+    app = create_app(engine_factory=engine_factory, tokenizer_factory=lambda _: tokenizer)
+    return app, tokenizer
+
+
 def test_chat_completions_non_streaming():
-    app = create_app(engine_factory=FakeEngine)
+    app, tokenizer = _make_app(FakeEngine)
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
@@ -42,10 +65,11 @@ def test_chat_completions_non_streaming():
     assert payload["object"] == "chat.completion"
     assert payload["choices"][0]["message"]["content"] == "pong"
     assert response.headers["X-Request-Id"] == payload["request_id"]
+    assert tokenizer.calls[0]["messages"] == [{"role": "user", "content": "ping"}]
 
 
 def test_chat_completions_streaming():
-    app = create_app(engine_factory=FakeEngine)
+    app, tokenizer = _make_app(FakeEngine)
     with TestClient(app) as client:
         with client.stream(
             "POST",
@@ -65,11 +89,12 @@ def test_chat_completions_streaming():
     assert '"content": "po"' in body
     assert '"content": "ng"' in body
     assert "[DONE]" in body
+    assert tokenizer.calls[0]["messages"] == [{"role": "user", "content": "ping"}]
 
 
 class RawOutputEngine(FakeEngine):
     def generate(self, prompt: str, on_token, request_id: str, **_) -> str:
-        assert "User: ping" in prompt
+        assert '"content": "ping"' in prompt
         assert request_id
         content = "<think>internal</think>final"
         on_token(content)
@@ -77,7 +102,7 @@ class RawOutputEngine(FakeEngine):
 
 
 def test_chat_completions_preserve_raw_model_output():
-    app = create_app(engine_factory=RawOutputEngine)
+    app, _ = _make_app(RawOutputEngine)
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
@@ -96,8 +121,8 @@ def test_chat_completions_preserve_raw_model_output():
 class ToolCallEngine(FakeEngine):
     def generate(self, prompt: str, on_token, request_id: str, **_) -> str:
         assert "Available functions:" in prompt
-        assert "Tool choice policy:" in prompt
-        assert '"type":"function","function":{"name":"function_name","arguments":{"arg_name":"value"}}' in prompt
+        assert "User: What is the weather in Hangzhou?" in prompt
+        assert '"name": "get_weather"' in prompt
         content = json.dumps(
             {
                 "tool_calls": [
@@ -118,7 +143,20 @@ class ToolCallEngine(FakeEngine):
 class InvalidToolCallEngine(FakeEngine):
     def generate(self, prompt: str, on_token, request_id: str, **_) -> str:
         assert "Available functions:" in prompt
+        assert '"name": "get_weather"' in prompt
         content = '{"tool_calls":[{"name":"missing_args"}]}'
+        on_token(content)
+        return content
+
+
+class MalformedWeatherToolCallEngine(FakeEngine):
+    def generate(self, prompt: str, on_token, request_id: str, **_) -> str:
+        assert "Available functions:" in prompt
+        assert '"name": "get_weather"' in prompt
+        content = (
+            "I should call the weather function.\n\n"
+            '{"tool_calls":[{"type":"function","function":{"name":"get_weather","arguments":{"city":"Hangzhou"}}]}}'
+        )
         on_token(content)
         return content
 
@@ -177,7 +215,7 @@ def _add_request_payload(prompt: str = "Please add 12 and 30.", tool_choice=None
 
 
 def test_chat_completions_return_tool_calls():
-    app = create_app(engine_factory=ToolCallEngine)
+    app, tokenizer = _make_app(ToolCallEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_tool_request_payload())
 
@@ -189,6 +227,102 @@ def test_chat_completions_return_tool_calls():
     assert tool_call["type"] == "function"
     assert tool_call["function"]["name"] == "get_weather"
     assert tool_call["function"]["arguments"] == '{"city": "Hangzhou"}'
+    assert tokenizer.calls[0]["tools"] is None
+    assert "Available functions:" in tokenizer.calls[0]["messages"][0]["content"]
+
+
+def test_chat_completions_keep_tool_result_messages_on_follow_up_round():
+    class ToolFollowUpEngine(FakeEngine):
+        def generate(self, prompt: str, on_token, request_id: str, **_) -> str:
+            assert '"tool_call_id": "call_1"' in prompt
+            assert '"content": "{\\"city\\":\\"南京\\",\\"weather\\":\\"sunny\\",\\"temperature_c\\":25}"' in prompt
+            assert "Available functions:" not in prompt
+            content = "南京当前默认天气为 sunny，温度约25°C。"
+            on_token(content)
+            return content
+
+    app, tokenizer = _make_app(ToolFollowUpEngine)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "rkllm-local",
+                "messages": [
+                    {"role": "user", "content": "南京天气如何"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "get_whether",
+                                    "arguments": '{"city":"南京"}',
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "content": '{"city":"南京","weather":"sunny","temperature_c":25}',
+                        "tool_call_id": "call_1",
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "get_whether",
+                            "description": "Get weather by city",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"city": {"type": "string"}},
+                                "required": ["city"],
+                            },
+                        },
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert tokenizer.calls[0]["messages"] == [
+        {"role": "user", "content": "南京天气如何"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "get_whether",
+                        "arguments": '{"city":"南京"}',
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "content": '{"city":"南京","weather":"sunny","temperature_c":25}',
+            "tool_call_id": "call_1",
+        },
+    ]
+    assert tokenizer.calls[0]["tools"] == [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_whether",
+                "description": "Get weather by city",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"city": {"type": "string"}},
+                    "required": ["city"],
+                },
+            },
+        }
+    ]
 
 
 def test_chat_completions_accept_legacy_tool_call_shape():
@@ -207,7 +341,7 @@ def test_chat_completions_accept_legacy_tool_call_shape():
             on_token(content)
             return content
 
-    app = create_app(engine_factory=LegacyToolCallEngine)
+    app, _ = _make_app(LegacyToolCallEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_tool_request_payload())
 
@@ -218,8 +352,21 @@ def test_chat_completions_accept_legacy_tool_call_shape():
     assert tool_call["function"]["name"] == "get_weather"
 
 
+def test_chat_completions_repair_malformed_weather_tool_call():
+    app, _ = _make_app(MalformedWeatherToolCallEngine)
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=_tool_request_payload())
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["choices"][0]["finish_reason"] == "tool_calls"
+    tool_call = payload["choices"][0]["message"]["tool_calls"][0]
+    assert tool_call["function"]["name"] == "get_weather"
+    assert tool_call["function"]["arguments"] == '{"city": "Hangzhou"}'
+
+
 def test_chat_completions_degrade_on_invalid_tool_call_payload():
-    app = create_app(engine_factory=InvalidToolCallEngine)
+    app, _ = _make_app(InvalidToolCallEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_tool_request_payload())
 
@@ -230,7 +377,7 @@ def test_chat_completions_degrade_on_invalid_tool_call_payload():
 
 
 def test_chat_completions_reject_streaming_tool_calls():
-    app = create_app(engine_factory=ToolCallEngine)
+    app, _ = _make_app(ToolCallEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_tool_request_payload(stream=True))
 
@@ -239,7 +386,7 @@ def test_chat_completions_reject_streaming_tool_calls():
 
 
 def test_chat_completions_accept_forced_tool_choice():
-    app = create_app(engine_factory=ToolCallEngine)
+    app, _ = _make_app(ToolCallEngine)
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
@@ -253,7 +400,8 @@ def test_chat_completions_accept_forced_tool_choice():
 
 class AddStandardToolCallEngine(FakeEngine):
     def generate(self, prompt: str, on_token, request_id: str, **_) -> str:
-        assert '"name":"add"' in prompt or '"name": "add"' in prompt
+        assert "Available functions:" in prompt
+        assert '"name": "add"' in prompt
         content = json.dumps(
             {
                 "tool_calls": [
@@ -339,7 +487,7 @@ def _assert_add_tool_call_response(response):
 
 
 def test_chat_completions_accept_add_standard_tool_call():
-    app = create_app(engine_factory=AddStandardToolCallEngine)
+    app, _ = _make_app(AddStandardToolCallEngine)
     with TestClient(app) as client:
         response = client.post(
             "/v1/chat/completions",
@@ -350,7 +498,7 @@ def test_chat_completions_accept_add_standard_tool_call():
 
 
 def test_chat_completions_accept_add_legacy_shape():
-    app = create_app(engine_factory=AddLegacyToolCallEngine)
+    app, _ = _make_app(AddLegacyToolCallEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_add_request_payload())
 
@@ -358,7 +506,7 @@ def test_chat_completions_accept_add_legacy_shape():
 
 
 def test_chat_completions_repair_add_missing_closing_brace():
-    app = create_app(engine_factory=AddBrokenBraceEngine)
+    app, _ = _make_app(AddBrokenBraceEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_add_request_payload())
 
@@ -366,7 +514,7 @@ def test_chat_completions_repair_add_missing_closing_brace():
 
 
 def test_chat_completions_repair_add_tuple_like_arguments():
-    app = create_app(engine_factory=AddTupleArgumentsEngine)
+    app, _ = _make_app(AddTupleArgumentsEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_add_request_payload())
 
@@ -374,7 +522,7 @@ def test_chat_completions_repair_add_tuple_like_arguments():
 
 
 def test_chat_completions_repair_add_list_arguments():
-    app = create_app(engine_factory=AddListArgumentsEngine)
+    app, _ = _make_app(AddListArgumentsEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_add_request_payload())
 
@@ -382,7 +530,7 @@ def test_chat_completions_repair_add_list_arguments():
 
 
 def test_chat_completions_repair_add_expression_arguments():
-    app = create_app(engine_factory=AddExpressionArgumentsEngine)
+    app, _ = _make_app(AddExpressionArgumentsEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_add_request_payload())
 
@@ -390,7 +538,7 @@ def test_chat_completions_repair_add_expression_arguments():
 
 
 def test_chat_completions_repair_add_named_text_arguments():
-    app = create_app(engine_factory=AddNamedTextArgumentsEngine)
+    app, _ = _make_app(AddNamedTextArgumentsEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_add_request_payload())
 
@@ -398,7 +546,7 @@ def test_chat_completions_repair_add_named_text_arguments():
 
 
 def test_chat_completions_do_not_repair_add_with_single_number():
-    app = create_app(engine_factory=AddSingleNumberEngine)
+    app, _ = _make_app(AddSingleNumberEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_add_request_payload())
 
@@ -408,7 +556,7 @@ def test_chat_completions_do_not_repair_add_with_single_number():
 
 
 def test_chat_completions_do_not_repair_add_with_too_many_numbers():
-    app = create_app(engine_factory=AddTooManyNumbersEngine)
+    app, _ = _make_app(AddTooManyNumbersEngine)
     with TestClient(app) as client:
         response = client.post("/v1/chat/completions", json=_add_request_payload())
 

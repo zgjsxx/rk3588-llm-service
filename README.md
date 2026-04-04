@@ -72,6 +72,20 @@ dist/native/linux_aarch64/
 
 ## Run API
 
+Place the Hugging Face tokenizer files for `DeepSeek-R1-Distill-Qwen-1.5B` in a local directory before starting the API. By default the service expects:
+
+```text
+models/DeepSeek-R1-Distill-Qwen-1.5B/
+```
+
+You can override this with `RKLLM_TOKENIZER_PATH`.
+
+Download the tokenizer files with:
+
+```bash
+python scripts/download_tokenizer.py
+```
+
 ```bash
 chmod +x scripts/run-api.sh
 ./scripts/run-api.sh
