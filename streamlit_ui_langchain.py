@@ -11,6 +11,7 @@ from langchain.agents import create_agent
 from langchain_openai import ChatOpenAI
 
 from service.response_cleaning import split_response_text
+from service.trace import trace_event
 
 
 DEFAULT_API_BASE = "http://127.0.0.1:8000"
@@ -100,7 +101,7 @@ def render_history() -> None:
             st.markdown(answer_text or message["content"])
 
 
-def create_langchain_agent() -> Any:
+def create_langchain_agent(request_id: str) -> Any:
     model = ChatOpenAI(
         model=st.session_state.model_name,
         api_key="dummy",
@@ -108,6 +109,7 @@ def create_langchain_agent() -> Any:
         temperature=float(st.session_state.temperature),
         max_tokens=int(st.session_state.max_tokens),
         timeout=float(st.session_state.timeout),
+        extra_body={"request_id": request_id},
     )
     return create_agent(
         model=model,
@@ -116,7 +118,7 @@ def create_langchain_agent() -> Any:
     )
 
 
-def create_chat_model() -> ChatOpenAI:
+def create_chat_model(request_id: str) -> ChatOpenAI:
     return ChatOpenAI(
         model=st.session_state.model_name,
         api_key="dummy",
@@ -124,6 +126,7 @@ def create_chat_model() -> ChatOpenAI:
         temperature=float(st.session_state.temperature),
         max_tokens=int(st.session_state.max_tokens),
         timeout=float(st.session_state.timeout),
+        extra_body={"request_id": request_id},
     )
 
 
@@ -247,6 +250,48 @@ def fallback_tool_answer(prompt: str) -> str | None:
     return None
 
 
+def emit_ui_agent_request_trace(
+    request_id: str,
+    *,
+    messages: list[dict[str, Any]],
+    mode: str,
+) -> None:
+    trace_event(
+        "ui.agent.request",
+        request_id=request_id,
+        api_base=st.session_state.api_base,
+        model=st.session_state.model_name,
+        mode=mode,
+        messages=messages,
+    )
+
+
+def emit_ui_agent_response_trace(
+    request_id: str,
+    *,
+    mode: str,
+    status: str,
+    response_text: str,
+    tool_runs: list[dict[str, Any]] | None = None,
+    error: str | None = None,
+    agent_result: Any = None,
+    fallback_used: bool = False,
+) -> None:
+    trace_event(
+        "ui.agent.response",
+        request_id=request_id,
+        api_base=st.session_state.api_base,
+        model=st.session_state.model_name,
+        mode=mode,
+        status=status,
+        response_text=response_text,
+        tool_runs=tool_runs or [],
+        error=error,
+        agent_result=str(agent_result) if agent_result is not None else None,
+        fallback_used=fallback_used,
+    )
+
+
 st.set_page_config(page_title="RKLLM Chat UI (LangChain)", page_icon=":speech_balloon:", layout="wide")
 init_state()
 
@@ -340,15 +385,20 @@ if prompt:
         use_tooling = should_use_tooling(prompt)
         use_stream = bool(st.session_state.stream_responses and not use_tooling)
         st.session_state.last_trace["mode"] = "stream" if use_stream else "invoke"
+        emit_ui_agent_request_trace(
+            request_id,
+            messages=list(st.session_state.agent_messages),
+            mode=st.session_state.last_trace["mode"],
+        )
 
         if use_stream:
-            model = create_chat_model()
+            model = create_chat_model(request_id)
             with st.chat_message("assistant"):
                 response_text = stream_plain_chat(model, list(st.session_state.agent_messages))
             result = {"streamed": True, "tools_enabled": False}
             tool_runs: list[dict[str, Any]] = []
         else:
-            agent = create_langchain_agent()
+            agent = create_langchain_agent(request_id)
             result = agent.invoke(
                 {"messages": list(st.session_state.agent_messages)},
                 config={"recursion_limit": 6},
@@ -367,6 +417,14 @@ if prompt:
         st.session_state.last_trace["response_text"] = response_text
         st.session_state.last_trace["tool_runs"] = tool_runs
         st.session_state.last_trace["agent_result"] = str(result)
+        emit_ui_agent_response_trace(
+            request_id,
+            mode=st.session_state.last_trace["mode"],
+            status="ok",
+            response_text=response_text,
+            tool_runs=tool_runs,
+            agent_result=result,
+        )
     except httpx.HTTPError as exc:
         response_text = f"Request failed: {exc}"
         with st.chat_message("assistant"):
@@ -375,6 +433,13 @@ if prompt:
         st.session_state.last_trace["status"] = "http_error"
         st.session_state.last_trace["error"] = str(exc)
         st.session_state.last_trace["response_text"] = response_text
+        emit_ui_agent_response_trace(
+            request_id,
+            mode=st.session_state.last_trace["mode"],
+            status="http_error",
+            response_text=response_text,
+            error=str(exc),
+        )
     except Exception as exc:
         error_text = str(exc)
         fallback_text = fallback_tool_answer(prompt) if "Recursion limit" in error_text else None
@@ -387,5 +452,13 @@ if prompt:
         st.session_state.last_trace["response_text"] = response_text
         if fallback_text:
             st.session_state.last_trace["fallback_used"] = True
+        emit_ui_agent_response_trace(
+            request_id,
+            mode=st.session_state.last_trace["mode"],
+            status=st.session_state.last_trace["status"],
+            response_text=response_text,
+            error=error_text,
+            fallback_used=bool(fallback_text),
+        )
 
     st.rerun()

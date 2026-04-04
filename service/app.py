@@ -99,6 +99,29 @@ def _normalize_tool_arguments(arguments: Any) -> str:
     return json.dumps(arguments, ensure_ascii=False, sort_keys=True)
 
 
+def _extract_normal_answer_text(content: str) -> str | None:
+    for candidate in _tool_payload_candidates(content):
+        for variant in _json_repair_variants(candidate):
+            try:
+                payload = json.loads(variant)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            raw_tool_calls = payload.get("tool_calls")
+            if not isinstance(raw_tool_calls, list) or len(raw_tool_calls) != 1:
+                continue
+            first = raw_tool_calls[0]
+            if not isinstance(first, dict):
+                continue
+            if first.get("type") != "normal_answer":
+                continue
+            answer = first.get("answer")
+            if isinstance(answer, str) and answer.strip():
+                return answer.strip()
+    return None
+
+
 def _has_tool(request: ChatCompletionRequest, name: str) -> bool:
     return bool(request.tools) and any(tool.function.name == name for tool in request.tools)
 
@@ -303,9 +326,9 @@ def _parse_tool_calls(
                 request_id=request_id,
                 repair_applied=False,
                 repair_strategy=repair_strategy,
-                    repair_error=repair_error or f"invalid_json:{exc.msg}",
-                    repaired_tool_calls=None,
-                )
+                repair_error=repair_error or f"invalid_json:{exc.msg}",
+                repaired_tool_calls=None,
+            )
         repaired, repair_strategy, repair_error = _repair_generic_tool_payload(
             content,
             allowed_tool_names,
@@ -504,6 +527,7 @@ def create_app(
             "raw_payload": raw_payload,
             "raw_payload_error": raw_payload_error,
         }
+        trace_event("fastapi.request.payload", **stdout_request_fields)
         trace_stdout_event("fastapi.request.payload", **stdout_request_fields)
         prompt = build_prompt(
             request.messages,
@@ -564,7 +588,18 @@ def create_app(
                 tool_call_parse_error=parse_error,
             )
 
-            message: dict[str, Any] = {"role": "assistant", "content": content}
+            normal_answer_text = _extract_normal_answer_text(content)
+            if normal_answer_text is not None:
+                trace_event(
+                    "fastapi.response.normal_answer_unwrapped",
+                    request_id=request_id,
+                    answer_text=normal_answer_text,
+                )
+
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "content": normal_answer_text if normal_answer_text is not None else content,
+            }
             finish_reason = "stop"
             if parsed_tool_calls is not None:
                 message = {
@@ -589,6 +624,11 @@ def create_app(
                 ],
                 "usage": _usage(prompt, content),
             }
+            trace_event(
+                "fastapi.response.payload",
+                request_id=request_id,
+                response_payload=response_payload,
+            )
             response = JSONResponse(content=response_payload)
             response.headers["X-Request-Id"] = request_id
             return response
@@ -690,6 +730,15 @@ def create_app(
                             }
                         ],
                     }
+                    trace_event(
+                        "fastapi.response.payload",
+                        request_id=request_id,
+                        response_payload={
+                            "stream": True,
+                            "final_chunk": final_chunk,
+                            "done": True,
+                        },
+                    )
                     yield f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                 finally:

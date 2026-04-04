@@ -72,6 +72,20 @@ dist/native/linux_aarch64/
 
 ## Run API
 
+The RKLLM model file is not committed to this repository because it is too large. Put the model file below into `models/` before starting the API:
+
+```text
+models/DeepSeek-R1-Distill-Qwen-1.5B_W8A8_RK3588.rkllm
+```
+
+Baidu Netdisk download:
+
+```text
+File: DeepSeek-R1-Distill-Qwen-1.5B_W8A8_RK3588.rkllm
+Link: https://pan.baidu.com/s/1oikxuOh13rYmUjkX1Vf2EA
+Code: 8q74
+```
+
 Place the Hugging Face tokenizer files for `DeepSeek-R1-Distill-Qwen-1.5B` in a local directory before starting the API. By default the service expects:
 
 ```text
@@ -137,6 +151,27 @@ This UI uses LangChain 1.x `create_agent` with two built-in tools:
 
 - `add(a, b)`
 - `get_whether(city)`
+
+## Run Trace Viewer
+
+Start the API and one of the UIs first, then launch the dedicated trace viewer:
+
+```bash
+chmod +x scripts/run-trace-ui.sh
+./scripts/run-trace-ui.sh
+```
+
+Open `http://127.0.0.1:8503`.
+
+The trace viewer shows one complete request chain with these steps:
+
+- `Agent 发起请求`
+- `Service 收到原始请求`
+- `Service 解析后的请求`
+- `发送给模型的提示词`
+- `模型原始输出`
+- `Service 返回结果`
+- `Agent 最终展示结果`
 
 ## Model Export
 
